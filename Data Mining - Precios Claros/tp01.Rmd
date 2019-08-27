@@ -1,0 +1,1086 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+Carga de las librerías
+```{r}
+library(mongolite) # Cliente de MongoDB
+library(rgdal) # Para leer un archivo .geojson
+library(sp) # Para hacer queries geoespaciales
+library(ggplot2) # Libreria grafica
+library(gridExtra)
+library(devtools)
+#install_github("vqv/ggbiplot") # Instala paquete desde GitHub
+library(ggbiplot) # Paquete paravisualización de componentes principales
+library(ggrepel)
+
+library(ca) #PAquete para analisis de correspondencias
+library(FactoMineR)
+library(factoextra)
+
+library(dplyr) # Para hacer queries tipo SQL
+```
+
+Guardamos en DataFrames las colecciones almacenadas en baso de datos.
+```{r}
+sucursales <- mongo(collection = "sucursales", db = "precios_caba")$find()
+productos <- mongo(collection = "productos", db = "precios_caba")$find()
+precios <- mongo(collection = "precios", db = "precios_caba")$find()
+
+sucursales <- sucursales[sucursales$sucursalTipo != "Autoservicio", ]
+```
+
+Almacenamos los barrios de CABA con su conteniedo geoespacial (polígonos que determinan los límites de cada barrio)
+```{r}
+barrios <- readOGR(dsn="data/barrios.geojson")
+```
+
+DataFrame con la cotización del dolar en las fechas de interés.
+```{r}
+dolar <- read.csv(file="data/cotizacion_dolar_bna.csv", header=TRUE, dec=',')
+```
+
+Seteamos la el campo fecha de la tabla "dolar" y "precios" a un mismo formato para hacer después un join 
+```{r}
+dolar$Fecha = as.Date(dolar$Fecha, format = "%d/%m/%Y")
+precios$fecha = as.Date(precios$fecha, format = "%Y-%m-%d")
+```
+
+Transformamos el dataframe sucursales en un tipo SpaciaPoints (conjunto de puntos) y establecemos el campo "lng" y "lat" como la Longitud y Latitud de cada sucursal
+```{r}
+coordinates(sucursales) <- ~lng+lat
+
+# Establecemos el mismo sistema de coordenadas geográfico que el de "barrios"
+proj4string(sucursales) <- proj4string(barrios)
+proj4string(sucursales)
+```
+
+Hacemos un query geoespacial para obtener a qué barrio pertenece cada sucursal. El query va a encontrar, para cada sucursal representada como un punto, qué polígono (barrio) la contiene.
+```{r}
+# Para cada sucursal obtenemos el barrio al que pertenece (el barrio, representado por un poligono, que contiene a esa sucursal)
+sucursales.con.barrio <- over(sucursales, barrios)
+
+# Juntamos las sucursales, sus coordenadas espaciales y el barrio (+ comuna, perímetro y área) al que pertenece en un solo dataframe
+sucursales.con.barrio <- cbind(sucursales@data, sucursales@coords, sucursales.con.barrio)
+```
+
+Chequeamos que no hayan sucursales sin barrion asignado y que todas las sucursales tengan al menos una medicion:
+```{r}
+sucursales.con.barrio[is.na(sucursales.con.barrio$BARRIO),]
+```
+```{r}
+which(!(sucursales.con.barrio$id %in% precios$sucursal))
+```
+
+```{r}
+sucursales.con.barrio <- sucursales.con.barrio[-c(4, 27, 34, 60, 146), ]
+```
+
+Convertimos a factor las variables categóricas que pueden tomar un conjunto limitado de valores
+```{r}
+sucursales.con.barrio$BARRIO <- as.factor(sucursales.con.barrio$BARRIO)
+sucursales.con.barrio$COMUNA <- as.factor(sucursales.con.barrio$COMUNA)
+productos$marca <- as.factor(productos$marca)
+productos$categoria <- as.factor(productos$categoria)
+precios$medicion <- as.factor(precios$medicion)
+```
+
+Varios ID de productos en la tabla "precios" contienen por error ceros a su izquierda, con lo cual a la hora de hacer el join con la tabla "productos", no encuentran un match y los productos para ese precio quedan con valores NA. Por eso a continuación eliminamos todos los ceros a izquierda en el campo producto de la tabla "precios" mediante una expresion regular
+```{r}
+precios$producto = sub("^0*(.+)$", "\\1", precios$producto, perl=TRUE)
+```
+
+Hacemos 3 left joins de cada dataframe para unirlos en un único dataframe grande que contega los datos de precio, fecha, producto, sucursal, barrio, cotización del dolar, etc.
+```{r}
+precios <- left_join(precios, productos, by = c("producto" = "id"))
+precios <- left_join(precios, sucursales.con.barrio, by = c("sucursal" = "id"))
+precios <- left_join(precios, dolar, by = c("fecha" = "Fecha"))
+```
+
+Eliminamos columnas irrelevantes del dataset final
+```{r}
+precios <- subset(precios, select=-c(Divisa.Compra, Divisa.Venta))
+```
+
+Comprobamos que no hay ningún NA en el dataframe
+```{r}
+nrow(precios) == nrow(na.omit(precios))
+```
+
+```{r}
+summary(precios)
+```
+
+
+Mediciones por categoría:
+```{r}
+table(precios$categoria)
+```
+
+Sucursales 
+```{r}
+table(sucursales.con.barrio$BARRIO)
+```
+```{r}
+a = sucursales.con.barrio %>%
+  group_by(BARRIO) %>%
+  summarise(n = n())
+```
+
+```{r}
+precios.med1 <- precios[precios$medicion == 1,]
+
+# precios_bajos = precios1[precios1$precio <= 140,]
+# precios_medios = precios1[precios1$precio > 140 & precios1$precio <= 370,]
+# 
+# precios_bajos_super = precios_bajos[precios_bajos$sucursalTipo == 'Supermercado',]
+# precios_bajos_hiper = precios_bajos[precios_bajos$sucursalTipo == 'Hipermercado',]
+# 
+# precios_medios_super = precios_medios[precios_medios$sucursalTipo == 'Supermercado',]
+# precios_medios_hiper = precios_medios[precios_medios$sucursalTipo == 'Hipermercado',]
+```
+
+
+```{r}
+hist(precios.med1$precio, breaks="FD", col="blue", 
+     border="blue", main="Precios medición 1", xlab="Pesos", prob=TRUE)
+```
+
+
+```{r}
+ggplot(precios, aes(x=categoria, y=log(precio), fill=medicion)) +
+  geom_boxplot(outlier.shape=1) +
+  labs(title="Log Precios por categoria", x="Categoría", y="Precio") +
+  stat_summary(fun.y=mean, geom="point") +
+  theme(axis.text.x = element_text(angle = 45, size=7, hjust=.5))
+  #scale_y_continuous(limits=c(0, 400))
+```
+
+
+
+
+1. ANALISIS DE INCREMENTO DE PRECIOS SEGUN LA CATEGORIA
+
+Armamos una lista donde cada elemento es un dataframe con las diferentes categorias. Cada dataframe contendrá los precios promedio por día de la categoria correspondiente. 
+Aplicamos a cada conjunto una regresión lineal y comparamos qué categoría es la que más aumenta y la que menos aumenta en el tiempo. Para eso tomamos la pendiente de cada recta dividido la media (nos da una idea del porcentaje de incremento del precio por dia para esa categoria)
+
+```{r}
+precios.cat = list(almacen=NULL, frescos=NULL, congelados=NULL, con.alcohol=NULL, sin.alcohol=NULL, 
+                   limpieza=NULL, bebes=NULL, mascotas=NULL, perfumeria=NULL)
+
+precios.cat$almacen = precios %>% 
+  filter(categoria == "ALMACEN") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+  
+precios.cat$frescos = precios %>% 
+  filter(categoria == "FRESCOS") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$congelados = precios %>% 
+  filter(categoria == "ALIMENTOS CONGELADOS") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$con.alcohol = precios %>% 
+  filter(categoria == "BEBIDAS CON ALCOHOL") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$sin.alcohol = precios %>% 
+  filter(categoria == "BEBIDAS SIN ALCOHOL") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$limpieza = precios %>% 
+  filter(categoria == "LIMPIEZA") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$bebes = precios %>% 
+  filter(categoria == "BEBES") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$mascotas = precios %>% 
+  filter(categoria == "MASCOTAS") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+
+precios.cat$perfumeria = precios %>% 
+  filter(categoria == "PERFUMERIA Y CUIDADO PERSONAL") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean((precio)))
+```
+
+```{r}
+ggplot(precios.cat$almacen,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(52, 82)) +
+  ggtitle("Almacen")
+
+ggplot(precios.cat$frescos,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(38, 68)) +
+  ggtitle("Frescos")
+
+ggplot(precios.cat$congelados,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(132, 162)) +
+  ggtitle("Alimentas congelados")
+
+ggplot(precios.cat$con.alcohol,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(122, 152)) +
+  ggtitle("Bebidas con alcohol")
+
+ggplot(precios.cat$sin.alcohol,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(29, 59)) +
+  ggtitle("Bebidas sin alcohol")
+
+ggplot(precios.cat$limpieza,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(78, 108)) +
+  ggtitle("Limpieza")
+
+ggplot(precios.cat$bebes,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(102, 132)) +
+  ggtitle("Bebés")
+
+ggplot(precios.cat$mascotas,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(60, 90)) +
+  ggtitle("Mascotas")
+
+ggplot(precios.cat$perfumeria,aes(fecha,precio)) + 
+  geom_point(color='blue') +
+  geom_smooth(method='lm', color='red') +
+  scale_y_continuous(limits = c(90, 120)) +
+  ggtitle("Perfumería y cuidado personal")
+```
+
+
+```{r}
+lm.almacen <- lm(precio ~ fecha, data=precios.cat$almacen)
+lm.frescos <- lm(precio ~ fecha, data=precios.cat$frescos)
+lm.congelados <- lm(precio ~ fecha, data=precios.cat$congelados)
+lm.con.alcohol <- lm(precio ~ fecha, data=precios.cat$con.alcohol)
+lm.sin.alcohol <- lm(precio ~ fecha, data=precios.cat$sin.alcohol)
+lm.limpieza <- lm(precio ~ fecha, data=precios.cat$limpieza)
+lm.bebes <- lm(precio ~ fecha, data=precios.cat$bebes)
+lm.mascotas <- lm(precio ~ fecha, data=precios.cat$mascotas)
+lm.perfumeria <- lm(precio ~ fecha, data=precios.cat$perfumeria)
+```
+
+```{r}
+categorias = unique(productos$categoria)
+medidas.de.crecimiento = c("No norm - Div. Media", "No norm - Div. Media Log.")
+
+cat.con.crecimiento = matrix(nrow=length(categorias), ncol=length(medidas.de.crecimiento))
+
+rownames(cat.con.crecimiento) = categorias
+colnames(cat.con.crecimiento) = medidas.de.crecimiento
+
+cat.con.crecimiento["ALMACEN", 1] = 
+  lm.almacen$coefficients[2] / mean(precios.cat$almacen$precio)
+cat.con.crecimiento["FRESCOS", 1] = 
+  lm.frescos$coefficients[2] / mean(precios.cat$frescos$precio)
+cat.con.crecimiento["ALIMENTOS CONGELADOS", 1] = 
+  lm.congelados$coefficients[2] / mean(precios.cat$congelados$precio)
+cat.con.crecimiento["BEBIDAS CON ALCOHOL", 1] = 
+  lm.con.alcohol$coefficients[2] / mean(precios.cat$con.alcohol$precio)
+cat.con.crecimiento["BEBIDAS SIN ALCOHOL", 1] = 
+  lm.sin.alcohol$coefficients[2] / mean(precios.cat$sin.alcohol$precio)
+cat.con.crecimiento["LIMPIEZA", 1] = 
+  lm.limpieza$coefficients[2] / mean(precios.cat$limpieza$precio)
+cat.con.crecimiento["BEBES", 1] = 
+  lm.bebes$coefficients[2] / mean(precios.cat$bebes$precio)
+cat.con.crecimiento["MASCOTAS", 1] = 
+  lm.mascotas$coefficients[2] / mean(precios.cat$mascotas$precio)
+cat.con.crecimiento["PERFUMERIA Y CUIDADO PERSONAL", 1] = 
+  lm.perfumeria$coefficients[2] / mean(precios.cat$perfumeria$precio)
+```
+
+Hacemos lo mismo pero con el promedio del logaritmo de los precios para cada categoria:
+
+```{r}
+precios.cat = list(almacen=NULL, frescos=NULL, congelados=NULL, con.alcohol=NULL, sin.alcohol=NULL, 
+                   limpieza=NULL, bebes=NULL, mascotas=NULL, perfumeria=NULL)
+
+precios.cat$almacen = precios %>% 
+  filter(categoria == "ALMACEN") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+  
+precios.cat$frescos = precios %>% 
+  filter(categoria == "FRESCOS") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$congelados = precios %>% 
+  filter(categoria == "ALIMENTOS CONGELADOS") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$con.alcohol = precios %>% 
+  filter(categoria == "BEBIDAS CON ALCOHOL") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$sin.alcohol = precios %>% 
+  filter(categoria == "BEBIDAS SIN ALCOHOL") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$limpieza = precios %>% 
+  filter(categoria == "LIMPIEZA") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$bebes = precios %>% 
+  filter(categoria == "BEBES") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$mascotas = precios %>% 
+  filter(categoria == "MASCOTAS") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+
+precios.cat$perfumeria = precios %>% 
+  filter(categoria == "PERFUMERIA Y CUIDADO PERSONAL") %>%
+  group_by(fecha) %>%
+  dplyr::summarise (precio = mean(log(precio)))
+```
+
+```{r}
+lm.almacen <- lm(precio ~ fecha, data=precios.cat$almacen)
+lm.frescos <- lm(precio ~ fecha, data=precios.cat$frescos)
+lm.congelados <- lm(precio ~ fecha, data=precios.cat$congelados)
+lm.con.alcohol <- lm(precio ~ fecha, data=precios.cat$con.alcohol)
+lm.sin.alcohol <- lm(precio ~ fecha, data=precios.cat$sin.alcohol)
+lm.limpieza <- lm(precio ~ fecha, data=precios.cat$limpieza)
+lm.bebes <- lm(precio ~ fecha, data=precios.cat$bebes)
+lm.mascotas <- lm(precio ~ fecha, data=precios.cat$mascotas)
+lm.perfumeria <- lm(precio ~ fecha, data=precios.cat$perfumeria)
+```
+
+```{r}
+cat.con.crecimiento["ALMACEN", 2] = 
+  lm.almacen$coefficients[2] / mean(precios.cat$almacen$precio)
+cat.con.crecimiento["FRESCOS", 2] = 
+  lm.frescos$coefficients[2] / mean(precios.cat$frescos$precio)
+cat.con.crecimiento["ALIMENTOS CONGELADOS", 2] = 
+  lm.congelados$coefficients[2] / mean(precios.cat$congelados$precio)
+cat.con.crecimiento["BEBIDAS CON ALCOHOL", 2] = 
+  lm.con.alcohol$coefficients[2] / mean(precios.cat$con.alcohol$precio)
+cat.con.crecimiento["BEBIDAS SIN ALCOHOL", 2] = 
+  lm.sin.alcohol$coefficients[2] / mean(precios.cat$sin.alcohol$precio)
+cat.con.crecimiento["LIMPIEZA", 2] = 
+  lm.limpieza$coefficients[2] / mean(precios.cat$limpieza$precio)
+cat.con.crecimiento["BEBES", 2] = 
+  lm.bebes$coefficients[2] / mean(precios.cat$bebes$precio)
+cat.con.crecimiento["MASCOTAS", 2] = 
+  lm.mascotas$coefficients[2] / mean(precios.cat$mascotas$precio)
+cat.con.crecimiento["PERFUMERIA Y CUIDADO PERSONAL", 2] = 
+  lm.perfumeria$coefficients[2] / mean(precios.cat$perfumeria$precio)
+```
+
+
+BOX PLOTS DE LOG DE PRECIOS POR BARRIO DE UNA DADA BANDERA, Y EN EL TIEMPO (VER QUE SE PUEDE HACER CON ESTO). EN PPIO PARECIERA QUE LAS DIFERENTES SUCURSALES DE UNA MISMA BANDERA NO VARIAN SUS PRECIOS ENTRE BARRIOS.
+
+```{r}
+precios.barrio = precios %>% 
+  filter(BARRIO %in% c("BALVANERA", "BELGRANO", "CABALLITO", "PALERMO", "RECOLETA")) %>%
+  filter(banderaDescripcion %in% c("COTO CICSA"))
+  #filter(precio <= 150) #%>%
+  
+#  group_by(BARRIO) %>%
+#  summarise (precio = mean(precio))
+
+ggplot(precios.barrio, aes(x=BARRIO, y=log(precio), fill=medicion)) +
+  geom_boxplot(outlier.shape=4) +
+  labs(title="Precios por barrio en el tiempo - Coto", x="Barrio", y="Precio") +
+  #stat_summary(fun.y=mean, geom="point") +
+  theme(axis.text.x = element_text(angle = 45, size=7, hjust=.5))
+  #scale_y_continuous(limits=c(0, 140))
+```
+```{r}
+hist(precios.barrio$precio, breaks="FD", col="blue", 
+     border="blue", main="Precios Coto - Principales Barrios", xlab="Pesos", ylab=NULL, prob=TRUE)
+```
+
+
+CREO MATRIZ CUYAS FILAS SON TODAS LAS SUCURSALES Y LAS COLUMNAS TODOS LOS PRODUCTOS. CADA CELDA ES EL PRECIO DE ESE PRODUCTO EN ESA SUCURSAL PROMEDIADO EN LAS 10 MEDICIONES (O 9 EN ALGUNOS CASOS)
+
+```{r}
+suc_index = order(sucursales.con.barrio$id)
+prod_index = order(productos$id)
+suc.ids <- sucursales.con.barrio[suc_index,]$id
+prod.ids <- productos[prod_index,]$id
+```
+
+```{r}
+suc.con.precios = matrix(NA, nrow = length(suc.ids), ncol = length(prod.ids)) # Esta va a ser la matriz definitiva
+rownames(suc.con.precios) <- suc.ids
+colnames(suc.con.precios) <- prod.ids
+
+precios.prom.med = precios %>% 
+  select(producto, sucursal, precio) %>% 
+  group_by(producto, sucursal) %>%
+  dplyr::summarise (precio = mean(precio),
+             cantidad = n())
+
+for (suc_id in suc.ids) {
+  pp = precios.prom.med %>% 
+    filter(sucursal == suc_id)  %>%
+    select(producto, precio)
+  
+  suc.con.precios[suc_id, pp$producto] = pp$precio
+}
+
+```
+
+```{r}
+length(suc.con.precios[is.na(suc.con.precios)])
+# 7689 de 175000 NA
+```
+
+```{r}
+# Funcion que imputa por media omitiendo los NA
+NA2mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+
+suc.con.precios <- cbind(data.frame(sucID = rownames(suc.con.precios)), as.data.frame(suc.con.precios))
+
+sucursales.con.barrio$id = as.character(sucursales.con.barrio$id)
+suc.con.precios$sucID = as.character(suc.con.precios$sucID)
+
+suc.con.precios.full <- left_join(suc.con.precios, sucursales.con.barrio, by = c("sucID" = "id"))[]
+
+suc.con.precios.full <- suc.con.precios.full %>%
+  filter(BARRIO %in% c("BALVANERA", "BELGRANO", "CABALLITO", "PALERMO", "RECOLETA")) %>%
+  filter(banderaDescripcion %in% c("COTO CICSA"))
+#ALMAGRO, FLORES Y SAN NICOLAS
+
+# Imputo por media pero dentro de cada banderaID
+# suc.con.precios.full <-
+#   suc.con.precios.full %>%
+#   group_by(banderaDescripcion) %>%
+#   mutate_at(2:1001, NA2mean)
+
+# Los NA que hayan quedado los vuelvo a imputar por media pero dentro de cada Razon Social
+# suc.con.precios.full <-
+#   suc.con.precios.full %>%
+#   group_by(comercioRazonSocial) %>%
+#   mutate_at(2:1001, NA2mean)
+
+suc.con.precios = suc.con.precios.full[, 2:1001]
+
+# Me quedo con las columnas (los productos) que hayan quedado con menos de 10 NA
+suc.con.precios = suc.con.precios[, colSums(is.na(suc.con.precios)) == 0]
+
+# Finalmente los restos de los NAs los imputo por el total de la columna
+#suc.con.precios = apply(suc.con.precios, 2, NA2mean)
+rownames(suc.con.precios) <- suc.con.precios.full$sucID
+
+#write.csv(prod.con.desvios, "prod.con.desvios.csv")
+dim(suc.con.precios)
+```
+
+```{r}
+suc.con.precios.band = suc.con.precios.full %>%
+  filter(banderaDescripcion == "JOSIMAR SUPERMERCADOS")
+
+suc.con.precios.band = suc.con.precios.band[, colSums(is.na(suc.con.precios.band)) == 0]
+ids.band <- suc.con.precios.band$sucID
+
+suc.con.precios.band = suc.con.precios.band[, 2:871]
+
+```
+
+2. QUE PRODUCTOS SON LOS QUE VARIAN MAS Y MENOS SUS PRECIOS ENTRE SUCURSALES? 
+
+```{r}
+# Lo mismo pero para los productos. 
+
+desvios.entre.suc = apply(suc.con.precios, 2, function(x) sd(x) / mean(x))
+
+desvios.entre.suc <- data.frame(prodID = names(desvios.entre.suc), desvio = desvios.entre.suc)
+desvios.entre.suc$prodID <- as.character(desvios.entre.suc$prodID)
+
+prod.con.desvios <- left_join(productos, desvios.entre.suc, by = c("id" = "prodID"))
+
+
+```
+
+```{r}
+desvios.entre.suc = apply(suc.con.precios.band, 2, function(x) sd(x) / mean(x))
+
+desvios.entre.suc <- data.frame(prodID = names(desvios.entre.suc), desvioJosimar = desvios.entre.suc)
+desvios.entre.suc$prodID <- as.character(desvios.entre.suc$prodID)
+
+prod.con.desvios <- left_join(prod.con.desvios, desvios.entre.suc, by = c("id" = "prodID"))
+
+```
+
+```{r}
+prod.con.variabilidad <- prod.con.desvios %>%
+  filter(!is.na(desvio)) %>%
+  filter(categoria != "MASCOTAS") %>%
+  mutate(variabilidad = cut(desvio, breaks= c(0,0.03,0.05,0.2), labels=c("BAJA", "MEDIA", "ALTA")))
+
+prod.con.variabilidad$categoria <- droplevels(prod.con.variabilidad$categoria)
+
+cat.var.table <- table(prod.con.variabilidad[,c(5,7)])
+cat.var.table
+
+```
+
+```{r}
+Xsq=chisq.test(cat.var.table)
+
+Xsq
+```
+
+
+```{r}
+Xsq$expected
+```
+Con un nivel de significancia del 5%, el chi-cuadrado con 7 * 2 = 14 grados de libertad es 23.68. En este caso dio 181.21, con lo cual que se rechaza la hipótesis de nulidad. Los valores esperados son mayores que 5, por lo tanto es válida la distribución asintótica del estadístico. 
+```{r}
+cat.variab.ca = CA(cat.var.table, graph=TRUE)
+#get_ca_col(cat.variab.ca)
+
+```
+
+
+
+```{r}
+fviz_contrib(cat.variab.ca, choice="row", axes=1, fill="royalblue", color="black") +
+theme_gray() +
+theme(axis.text.x= element_text (angle=45)) +
+xlab('Categorias') +
+ylab('Contribuciones(%)') +
+ggtitle('')
+
+fviz_contrib(cat.variab.ca, choice="col", axes=1, fill="royalblue", color="black") +
+theme_gray() +
+theme(axis.text.x= element_text (angle=45)) +
+xlab('Variabilidad entre sucursales') +
+ylab('Contribuciones(%)') +
+ggtitle('')
+```
+
+```{r}
+fviz_ca_biplot(cat.variab.ca, repel=TRUE, col.row="royalblue", col.col="indianred") +
+theme_gray () +
+xlab ('Dimensión 1 (87.98%)') +
+ylab ('Dimensión 2 (12.02%)') +
+ggtitle('')
+```
+
+3. QUE PRODUCTOS VARIAN MAS Y MENOS SUS PRECIOS EN EL TIEMPO?
+
+```{r}
+mediciones.con.precios = matrix(NA, nrow = 10, ncol = length(prod.ids)) 
+rownames(mediciones.con.precios) <- 1:10
+colnames(mediciones.con.precios) <- prod.ids
+
+precios.prom.suc = precios %>% 
+  select(producto, medicion, precio) %>% 
+  group_by(producto, medicion) %>%
+  dplyr::summarise (precio = mean(precio),
+             cantidad = n())
+
+for (med in 1:10) {
+  pp = precios.prom.suc %>% 
+    filter(medicion == med) %>%
+    select(producto, precio)
+  
+  mediciones.con.precios[med, pp$producto] = pp$precio
+}
+```
+
+
+```{r}
+desvios.prod.tiempo = apply(mediciones.con.precios, 2, function(x) sd(x) / mean(x))
+
+desvios.prod.tiempo <- data.frame(prodID = names(desvios.prod.tiempo), desvio = desvios.prod.tiempo)
+desvios.prod.tiempo$prodID <- as.character(desvios.prod.tiempo$prodID)
+
+prod.con.desvios.tiempo <- left_join(productos, desvios.prod.tiempo, by = c("id" = "prodID"))
+```
+
+```{r}
+prod.con.variabilidad.tiempo <- prod.con.desvios.tiempo %>%
+  filter(categoria != "MASCOTAS") %>%
+  mutate(variabilidad = cut(desvio, breaks= c(0,0.03,0.05,0.4), labels=c("BAJA", "MEDIA", "ALTA")))
+
+prod.con.variabilidad.tiempo$categoria <- droplevels(prod.con.variabilidad.tiempo$categoria)
+
+cat.var.t.table <- table(prod.con.variabilidad.tiempo[,c(5,7)])
+cat.var.t.table
+
+```
+
+```{r}
+Xsq=chisq.test(cat.var.t.table)
+
+Xsq
+```
+
+
+```{r}
+Xsq$expected
+```
+
+```{r}
+cat.variab.tiempo.ca = CA(cat.var.t.table, graph=TRUE)
+```
+
+
+
+```{r}
+fviz_contrib(cat.variab.tiempo.ca, choice="row", axes=1, fill="royalblue", color="black") +
+theme_gray() +
+theme(axis.text.x= element_text (angle=45)) +
+xlab('Categorias') +
+ylab('Contribuciones(%)') +
+ggtitle('')
+
+fviz_contrib(cat.variab.tiempo.ca, choice="col", axes=1, fill="royalblue", color="black") +
+theme_gray() +
+theme(axis.text.x= element_text (angle=45)) +
+xlab('Variabilidad entre sucursales') +
+ylab('Contribuciones(%)') +
+ggtitle('')
+```
+
+```{r}
+fviz_ca_biplot(cat.variab.tiempo.ca, repel=TRUE, col.row="royalblue", col.col="indianred") +
+theme_gray () +
+xlab ('Dimensión 1 (85.52%)') +
+ylab ('Dimensión 2 (14.48%)') +
+ggtitle('')
+```
+
+
+```{r}
+mediciones.pca = prcomp(mediciones.con.precios, center=TRUE, scale. = TRUE)
+
+# Gráfico de sedimentación
+ggscreeplot(mediciones.pca, type=c('pev', 'cev')) +
+  xlab('Número de componentes principales') +
+  ylab('Proporción de la variabilidad explicada') +
+  geom_line(colour='royalblue') +
+  geom_point(colour='royalblue') + 
+  coord_cartesian(xlim=c(0, 15)) + 
+  ggtitle("Gráfico de sedimentación para todos los productos")
+```
+
+```{r}
+ggbiplot(mediciones.pca, obs.scale=1, choices = c(1,2), var.axes=FALSE, groups = 1:10, alpha=0.5) +
+#  geom_text_repel(aes(label=rownames(suc.con.precios))) +
+ # theme(legend.position="none") +
+  xlab("PC1 (90% de variabilidad explicada)") +
+  ylab("PC2 (2% de  de variabilidad explicada)")
+```
+
+```{r}
+cargas = data.frame(cbind(producto=productos$id[1:1000], PC1=data.frame(mediciones.pca$rotation)[1:1000,1], PC2=data.frame(mediciones.pca$rotation)[1:1000,2]))
+
+cargas$PC1 <- as.numeric(as.character(cargas$PC1))
+cargas$PC2 <- as.numeric(as.character(cargas$PC2))
+
+ggplot(cargas, aes(producto, PC1), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  xlab ('Productos') +
+  ylab ('Componente Principal 1')
+
+ggplot(cargas , aes(producto, PC2), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue", width=0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  xlab ('Productos') +
+  ylab ('Componente principal 2')
+
+
+```
+
+```{r}
+id.prod.raros.tiempo = names(mediciones.pca$rotation[mediciones.pca$rotation[,"PC1"] < -0.02,"PC1"])
+
+prod.tiempo.raros = productos %>%
+  filter(id %in% id.prod.raros.tiempo)
+
+```
+
+
+
+
+3. QUE SUCURSALES SE COMPARTEN SIMILARES CARACTERISTICAS? ANALISIS DE PCA, EN GENERAL PARA TODOS LOS PRODUCTOS Y DESPUES PARA LA "CANASTA BASICA"
+
+```{r}
+suc.pca = prcomp(suc.con.precios, center=TRUE, scale. = FALSE)
+
+# Gráfico de sedimentación
+ggscreeplot(suc.pca, type=c('pev', 'cev')) +
+  xlab('Número de componentes principales') +
+  ylab('Proporción de la variabilidad explicada') +
+  geom_line(colour='royalblue') +
+  geom_point(colour='royalblue') + 
+  coord_cartesian(xlim=c(0, 15)) + 
+  ggtitle("Gráfico de sedimentación para todos los productos")
+```
+
+```{r}
+ggbiplot(suc.pca, obs.scale=1, choices = c(1,2), var.axes=FALSE, groups = suc.con.precios.full$BARRIO, alpha=0.5) +
+#  geom_text_repel(aes(label=rownames(suc.con.precios))) +
+ # theme(legend.position="none") +
+  xlab("PC1 (39% de variabilidad explicada)") +
+  ylab("PC2 (13% de  de variabilidad explicada)") + 
+  ggtitle("Precios para sucursales de Disco y Jumbo")
+```
+- Nube azul mas chica son Veas
+- Nube azul grande son Discos y Jumbos
+- Nube verde chica: Carrefour Express
+- Nube verde grande: Carrefour Market e Hipermercado (estan mezclados)
+
+En orden de mas barato a mas caro:
+Carrefour market e hipermecado con Josimar, DIA, WALMart, Coto y Carregour Express (iguales), Vea, Jumbo y DIsco
+```{r}
+desv.prom = apply(prod.con.desvios[,6:14], 2, function(x) mean(x, na.rm = TRUE))
+
+```
+
+```{r}
+sort(desv.prom)
+```
+
+```{r}
+cargas = data.frame(cbind(producto=productos$id[1:821], PC1=data.frame(suc.pca$rotation)[1:821,1], PC2=data.frame(suc.pca$rotation)[1:821,2]))
+
+cargas$PC1 <- as.numeric(as.character(cargas$PC1))
+cargas$PC2 <- as.numeric(as.character(cargas$PC2))
+
+ggplot(cargas, aes(producto, PC1), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue") +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  xlab ('Productos') +
+  ylab ('Componente Principal 1')
+
+ggplot(cargas , aes(producto, PC2), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue", width=0.5) +
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank()) +
+  xlab ('Productos') +
+  ylab ('Componente principal 2')
+
+```
+HAY QUE FIJARSE QUE PRODUCTOS SON LOS PICOS NEGATIVOS. ES UN ANALISIS INTERESANTE, PORQUE SON PRODUCTOS QUE VAN AL REVES: ESOS PRODUCTOS SON MAS BARATOS EN LOS LUGARES MAS CAROS Y VICEVERSA.
+
+```{r}
+id.prod.raros = names(suc.pca$rotation[suc.pca$rotation[,"PC1"] < -0.02,"PC1"])
+
+prod.raros = productos %>%
+  filter(id %in% id.prod.raros)
+
+```
+
+
+ANALISIS CON CANASTA:
+```{r}
+# galletitas de agua = 123 (express pack 3), 348 (mediatarde x3), 166 (traviata x3)
+# galletitas dulces = 165 (surtidos diversion x400 g), 169 (surtido bagley x400g)
+# arroz = 246 (Arroz Largo Fino en Bolsa Lucchetti 1 Kg), 257 (Arroz Parbolizado Lucchetti 1 Kg)
+# harina = 761 (de Trigo 000 Cañuelas 1 Kg), 266 (de Trigo 000 Favorita 1 Kg), 773 (Trigo 0000Pureza 1 Kg)
+# fideos = 225 (Spaghetti Lucchetti 500 Gr), 234 (Spaghetti Matarazzo 500 Gr)
+# mermelada = 851 (Durazno Diet BC La Campagnola 390 Gr), 443 (Durazno Arcor 454 Gr), 847 (La Campagnola 454 Gr)
+# leche = 489 (Parcialmente Descremada La Serenisima 1 Lt), 875 (Parcialmente Descremada Armonia 1 Lt)
+# gaseosa = 527 (Coca Cola Light Sabor Liviano 1.5 Lt), 735 (Gaseosa Pepsi 1.5 Lt)
+# aceite = 194 (Cocinero 1.5 l), 351 (Natura), 768 (cañuelas)
+# agua = 362 (Villavicencio 1.5)
+
+canasta.index = c(166, 851, 875, 362, 194, 246, 169)
+productos[canasta.index,]
+```
+
+
+```{r}
+canasta.ids = productos[canasta.index,]$id
+
+suc.canasta = matrix(NA, nrow = length(suc.ids), ncol = length(canasta.ids))
+rownames(suc.canasta) <- suc.ids
+colnames(suc.canasta) <- canasta.ids
+
+precios.canasta = precios %>% 
+  filter(producto %in% canasta.ids)  %>%
+  select(producto, sucursal, precio) %>% 
+  group_by(producto, sucursal) %>%
+  dplyr::summarise (precio = mean(precio),
+             cantidad = n())
+
+for (suc_id in suc.ids) {
+  pp = precios.canasta %>% 
+    filter(sucursal == suc_id)  %>%
+    select(producto, precio)
+  
+  suc.canasta[suc_id, pp$producto] = pp$precio
+}
+```
+
+```{r}
+suc.canasta = apply(suc.canasta, 2, NA2mean)
+```
+
+```{r}
+canasta.pca = prcomp(suc.canasta, center=TRUE, scale. = TRUE)
+
+# Gráfico de sedimentación
+ggscreeplot(canasta.pca, type=c('pev', 'cev')) +
+  xlab('Número de componentes principales') +
+  ylab('Proporción de la variabilidad explicada') +
+  geom_line(colour='royalblue') +
+  geom_point(colour='royalblue') + 
+  ggtitle("Gráfico de sedimentación para productos de la canasta")
+```
+
+```{r}
+ggbiplot(canasta.pca, obs.scale=1, choices = c(1,2), var.axes=FALSE, groups = sucursales.con.barrio[suc_index,]$comercioRazonSocial, alpha=0.5) +
+  #geom_text_repel(aes(label=rownames(suc.con.precios))) +
+ # theme(legend.position="none") +
+  xlab("PC1 (54% de variabilidad explicada)") +
+  ylab("PC2 (17% de  de variabilidad explicada)")
+```
+
+Carrefour market e hipermecado, WALMart, Josimar, DIA y Coto similares, Carrefour Express, Vea, Jumbo y DIsco
+
+
+```{r}
+cargas = data.frame(cbind(producto=productos[canasta.index,]$nombre, PC1=data.frame(canasta.pca$rotation)[,1], PC2=data.frame(canasta.pca$rotation)[,2]), PC3=data.frame(canasta.pca$rotation)[,3])
+
+cargas$PC1 <- as.numeric(as.character(cargas$PC1))
+cargas$PC2 <- as.numeric(as.character(cargas$PC2))
+cargas$PC3 <- as.numeric(as.character(cargas$PC3))
+
+ggplot(cargas, aes(x = producto, y = PC1), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue", width=0.5) +
+  xlab ('Productos') +
+  ylab ('Componente Principal 1') +
+  theme(axis.text.x = element_text(angle = 45, size=7, hjust=.5))
+
+ggplot(cargas , aes(x=producto, y=PC2), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue", width=0.5) +
+  xlab ('Productos') +
+  ylab ('Componente Principal 1') +
+  theme(axis.text.x = element_text(angle = 45, size=7, hjust=.5))
+
+ggplot(cargas , aes(x=producto, y=PC3), fill=producto) +
+  geom_bar (stat="identity", position="dodge", fill="royalblue", width=0.5) +
+  xlab ('Productos') +
+  ylab ('Componente Principal 1') +
+  theme(axis.text.x = element_text(angle = 45, size=7, hjust=.5))
+
+```
+INTERESANTE VER LA COMPONENTE 2 Y 3 TAMBIEN. POR EJEMPLO, LAS SUCURSALES QUE TENGAN LA COMPONENTE 3 ALTA SIGNIFICA QUE TIENEN LAS GALLETITAS TRAVIATAS MAS BARATAS, Y VICEVERSA.
+
+
+
+
+4. ANALISIS DE COMO VARIA EN EL TIEMPO LOS PRODUCTOS DE LA CANASTA, SEPARADOS POR BANDERAS
+
+```{r}
+
+# Suma de los precios de la canasta basica, agrupados por bandera por dia
+
+# VARIA3 EL comercioRazonSocial para ir viendo los distintos graficos
+precios.canasta = precios %>% 
+  filter(producto %in% canasta.ids)  %>%
+#  filter(banderaDescripcion %in% c("COTO CICSA", "Supermercados DIA"))  %>%
+  group_by(medicion, comercioRazonSocial, banderaDescripcion, fecha, producto) %>%
+  dplyr::summarise (precio.prod.medio = mean(precio)) %>%
+  group_by(medicion, comercioRazonSocial, banderaDescripcion, fecha) %>%
+  dplyr::summarise (precioTotal = sum(precio.prod.medio),
+                    cantidad = n()) %>%
+  filter(cantidad == 7)
+
+g1 <- ggplot(precios.canasta, aes(x = fecha, y = precioTotal, group = banderaDescripcion, colour=banderaDescripcion)) + 
+  geom_point() +
+  geom_line() + 
+  ggtitle("Dia y Coto") + 
+  xlab (NULL) +
+  ylab ('Precio total de la canasta')
+
+ 
+ggplot(precios.totales, aes(x = fecha, y = Billete.Venta)) + geom_line() + 
+  ggtitle("Precio Dolar Venta") +
+  xlab(NULL) +
+  ylab('Pesos')
+
+ggsave("prueba.png", height = 2, width = 5)
+
+
+
+#grid.arrange(g2,g3,nrow=2)
+
+```
+
+
+5. ANALISIS DE COCA-PEPSI EN EL TIEMPO, EN LOS DIFERENTES TIPOS DE SUCURSALES
+```{r}
+
+# coca: light 1.5L = 527, original 2.25 = 507, sin azucar 1.5l = 557
+# pepsi: light 1.5 l = 733, normal 1.5 l = 735, normal 2.25 l = 737
+coca.pepsi.index = c(507, 557, 735, 737, 527, 733)
+coca.pepsi.ids = productos[coca.pepsi.index,]$id
+
+precios.coca.pepsi = precios %>% 
+  filter(producto %in% coca.pepsi.ids)  %>%
+  group_by(medicion, marca, fecha, producto, banderaDescripcion) %>%
+  dplyr::summarise (precio.prod.medio = mean(precio)) %>%
+  group_by(medicion, marca, fecha, banderaDescripcion) %>%
+  dplyr::summarise (precioTotal = sum(precio.prod.medio),
+                    cantidad = n()) %>%
+  filter(cantidad == 3)
+
+# ggplot(precios.coca.pepsi, aes(x = fecha, y = precioTotal, group = marca, colour=marca)) + 
+#   geom_line()
+#   geom_smooth(method="loess", se=FALSE, fullrange=TRUE, n=20, span=0.1)
+
+p1 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "COTO CICSA") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() + geom_point() +
+        scale_y_continuous(limits = c(160, 250)) +
+        ggtitle("Coto")
+
+p2 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "Disco") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() + geom_point() +
+        scale_y_continuous(limits = c(160, 250)) +
+        ggtitle("Disco")
+
+p3 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "Express") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() + geom_point() +
+        scale_y_continuous(limits = c(160, 250)) +
+        ggtitle("Carrefour Express")
+
+p4 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "Hipermercado Carrefour") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() + geom_point() +
+        scale_y_continuous(limits = c(160, 250)) +
+        ggtitle("Hipermercado Carrefour")
+
+p5 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "Market") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() + geom_point() +
+        scale_y_continuous(limits = c(160, 250)) +
+        ggtitle("Carrefour Market")
+
+p6 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "Supermercados DIA") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() +
+        ggtitle("Supermercados DIA")
+
+p7 <- precios.coca.pepsi %>% 
+        filter(banderaDescripcion == "Jumbo") %>%    
+        ggplot(aes(x=fecha, y=precioTotal, group=marca, colour=marca)) + geom_line() +
+        ggtitle("Jumbo")
+
+p8 <- ggplot(precios, aes(x = fecha, y = Billete.Compra)) + geom_line() 
+p9 <- p2 + theme(legend.position="none")
+
+# VARIAR ESTO PARA VER LOS DIFERENTES PLOTS
+grid.arrange(p4,p5,nrow=2)
+
+# DESCOMENTAR ESTO PARA VER LA VARIACION DEL DOLAR
+#grid.arrange(p8,p9,nrow=2)
+
+
+```
+
+PRECIOS TOTALES EN EL TIEMPO. NO SE SI SE PUEDE SACAR ALGO DE ESTO.
+```{r}
+precios.totales = precios %>% 
+#  filter(producto %in% canasta.ids)  %>%
+  group_by(medicion, comercioRazonSocial, banderaDescripcion, fecha, producto, Billete.Compra, Billete.Venta) %>%
+  dplyr::summarise (precio.prod.medio = mean(precio)) %>%
+  group_by(medicion, comercioRazonSocial, banderaDescripcion, fecha, Billete.Compra, Billete.Venta) %>%
+  dplyr::summarise (precio.medio = mean(precio.prod.medio),
+                    cantidad = n()) #%>%
+  #filter(cantidad == 7)
+
+
+p11 <- ggplot(precios.totales, aes(x = fecha, y = precio.medio, group = banderaDescripcion, 
+                                  colour=comercioRazonSocial)) + geom_line() + theme(legend.position="none")
+
+p12 <- ggplot(precios.totales, aes(x = fecha, y = Billete.Compra)) + geom_line() 
+p13 <- ggplot(precios.totales, aes(x = fecha, y = Billete.Venta)) + geom_line() 
+
+
+grid.arrange(p12,p13,nrow=2)
+
+
+```
+
+
+CORRELACION ENTRE TE Y CAFE
+```{r}
+# 908 = Mayonesa Doypack Hellmann's 237 Gr, 745 = Mayonesa Doypack Natura 237 Gr
+# 801 = Cerveza Negra Quilmes Stout 1 Lt, 825 = Cerveza Rubia Retornable Heineken 1 Lt
+
+#algunos.index = c(908, 745, 801, 825)
+algunos.index = c(400, 394, 87, 95)
+algunos.ids = productos[algunos.index,]$id
+
+precios.algunos = precios %>% 
+  filter(producto %in% algunos.ids)
+
+df.algunos = precios.algunos[!duplicated(t(apply(precios.algunos[c("sucursal", "fecha")], 1, sort))), c("sucursal", "fecha")]
+
+m = matrix(NA, nrow = nrow(df.algunos), ncol = 4)
+colnames(m) <- algunos.ids
+
+df.algunos = cbind(df.algunos, as.data.frame(m))
+
+for (pid in algunos.ids) {
+  pp = precios.algunos %>% 
+    filter(producto == pid) %>%
+    group_by(sucursal, fecha) %>%
+    dplyr::summarise (precio = mean(precio),
+                    cantidad = n())
+
+  for (i in 1:nrow(pp)) {
+    mask = (df.algunos$sucursal == pp$sucursal[[i]]) & (df.algunos$fecha == pp$fecha[[i]])
+    df.algunos[mask,pid] = pp$precio[[i]]
+  }
+}
+
+```
+
+```{r}
+cor(df.algunos[,3:6], use="complete.obs")
+
+```
+```{r}
+a = matrix(c(20, 18, 12, 17, 6, 22, 15, 13, 4, 6, 14, 11, 10, 19, 23, 40), nrow=4, ncol=4, byrow=TRUE)
+
+
+Xsq=chisq.test(a, correct=FALSE)
+
+Xsq
+```

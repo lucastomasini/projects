@@ -1,0 +1,582 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+Carga de las librerías
+```{r}
+library(mongolite) # Cliente de MongoDB
+library(rgdal) # Para leer un archivo .geojson
+library(sp) # Para hacer queries geoespaciales
+library(ggplot2) # Libreria grafica
+library(gridExtra)
+library(data.table)
+library(arules)
+library(arulesViz)
+library(imputeTS) # Para imputar interpolando valores adyacentes
+library(dplyr) # Para hacer queries tipo SQL
+```
+
+Guardamos en DataFrames las colecciones almacenadas en baso de datos.
+```{r}
+sucursales <- mongo(collection = "sucursales", db = "precios_caba")$find()
+productos <- mongo(collection = "productos", db = "precios_caba")$find()
+precios <- mongo(collection = "precios", db = "precios_caba")$find()
+
+# Descarto las sucursales de tipo Autoservicio ya que no tienen mediciones asociadas
+sucursales <- sucursales[sucursales$sucursalTipo != "Autoservicio", ]
+```
+
+Almacenamos los barrios de CABA con su conteniedo geoespacial (polígonos que determinan los límites de cada barrio)
+```{r}
+barrios <- readOGR(dsn="data/barrios.geojson")
+```
+
+DataFrame con la cotización del dolar en las fechas de interés.
+```{r}
+dolar <- read.csv(file="data/cotizacion_dolar_bna.csv", header=TRUE, dec=',')
+```
+
+Seteamos el campo fecha de la tabla "dolar" y "precios" a un mismo formato para hacer después un join 
+```{r}
+dolar$Fecha = as.Date(dolar$Fecha, format = "%d/%m/%Y")
+precios$fecha = as.Date(precios$fecha, format = "%Y-%m-%d")
+```
+
+Transformamos el dataframe sucursales en un tipo SpaciaPoints (conjunto de puntos) y establecemos el campo "lng" y "lat" como la Longitud y Latitud de cada sucursal
+```{r}
+coordinates(sucursales) <- ~lng+lat
+
+# Establecemos el mismo sistema de coordenadas geográfico que el de "barrios"
+proj4string(sucursales) <- proj4string(barrios)
+proj4string(sucursales)
+```
+
+Hacemos un query geoespacial para obtener a qué barrio pertenece cada sucursal. El query va a encontrar, para cada sucursal representada como un punto, qué polígono (barrio) la contiene.
+```{r}
+# Para cada sucursal obtenemos el barrio al que pertenece (el barrio, representado por un poligono, que contiene a esa sucursal)
+sucursales.con.barrio <- over(sucursales, barrios)
+
+# Juntamos las sucursales, sus coordenadas espaciales y el barrio (+ comuna, perímetro y área) al que pertenece en un solo dataframe
+sucursales.con.barrio <- cbind(sucursales@data, sucursales@coords, sucursales.con.barrio)
+```
+
+Chequeamos que no hayan sucursales sin barrion asignado y que todas las sucursales tengan al menos una medicion:
+```{r}
+sucursales.con.barrio[is.na(sucursales.con.barrio$BARRIO),]
+```
+```{r}
+which(!(sucursales.con.barrio$id %in% precios$sucursal))
+```
+
+```{r}
+sucursales.con.barrio <- sucursales.con.barrio[-c(4, 27, 34, 60, 146), ]
+```
+
+```{r}
+sucursales.con.barrio[, "AVENIDA"] = ifelse(startsWith(sucursales.con.barrio$direccion, 'Av'), 'SI', 'NO')
+sucursales.con.barrio[rownames(sucursales.con.barrio) %in% c("342", "387", "143", "675", "89"), "AVENIDA"] = 'SI'
+```
+
+
+Convertimos a factor las variables categóricas que pueden tomar un conjunto limitado de valores
+```{r}
+sucursales.con.barrio$BARRIO <- as.factor(sucursales.con.barrio$BARRIO)
+sucursales.con.barrio$AVENIDA <- as.factor(sucursales.con.barrio$AVENIDA)
+sucursales.con.barrio$COMUNA <- as.factor(sucursales.con.barrio$COMUNA)
+sucursales.con.barrio$comercioRazonSocial <- as.factor(sucursales.con.barrio$comercioRazonSocial)
+sucursales.con.barrio$sucursalTipo <- as.factor(sucursales.con.barrio$sucursalTipo)
+sucursales.con.barrio$banderaDescripcion <- as.factor(sucursales.con.barrio$banderaDescripcion)
+productos$marca <- as.factor(productos$marca)
+productos$categoria <- as.factor(productos$categoria)
+precios$medicion <- as.factor(precios$medicion)
+```
+
+Varios ID de productos en la tabla "precios" contienen por error ceros a su izquierda, con lo cual a la hora de hacer el join con la tabla "productos", no encuentran un match y los productos para ese precio quedan con valores NA. Por eso a continuación eliminamos todos los ceros a izquierda en el campo producto de la tabla "precios" mediante una expresion regular
+```{r}
+precios$producto = sub("^0*(.+)$", "\\1", precios$producto, perl=TRUE)
+```
+
+
+
+TRANSFORMACION DEL DATAFRAME 'PRECIOS' PARA ADAPTARLO AL ANALISIS MEDIANTE REGLAS DE ASOCIACION
+
+```{r}
+# Reubicamos cada medición como columna
+precios <- dcast(precios, producto + sucursal ~ medicion, value.var = 'precio')
+
+dim(precios)
+```
+Nos queda 167311 filas que representan precios de un determinado producto en una determinada sucursal. En las columnas del 1 al 10 se encuentran los precios por cada medición. 
+
+A continuación imputamos los NA que hayan quedado luego de la transformación.
+```{r}
+# Esta función toma un vector cualquiera y devuelve TRUE si existen 2 o más NA consecutivos. FALSE de lo contrario. 
+containsAdjacentNAs <- function(x) {
+  na.index = which(is.na(x))
+  n = length(na.index)
+  if (n < 2) return(FALSE)
+  dif = na.index[2:n] - na.index[1:n-1]
+  if (1 %in% dif) return(TRUE)
+  return(FALSE)
+}
+
+# Aplicamos la función de arriba a cada fila de la tabla precios, pero sobre las columnas correspondientes a las 10 mediciones. Esto nos devuelve una mascara que sirve para filtrar solo los registros que no contengan NAs adyacentes.
+mask <- apply(precios[,3:12], 1, containsAdjacentNAs)
+
+# Eliminamos todas las filas que contengan NA adyacentes
+precios <- precios[!mask, ]
+
+# Sabiendo ahora que no existen NAs adyacentes, imputamos los NAs utilizando el promedio de los precios aledaños a la celda a imputar
+precios[,3:12] <- t(na.interpolation(t(precios[,3:12]), method='constant', f=0.5))
+dim(precios)
+```
+Solo un 5.8% de los registros fueron eliminados luego de la imputación.
+
+A continuación generamos una tabla de 5 columnas, donde las 4 primeras representan a los períodos 1 al 4, y la quinta al total de las mediciones. Periodo1 = Noviembre, Periodo2 = Diciembre, Periodo1 = Enero, Periodo2 = Febrero
+```{r}
+periodos <- cbind(rowMeans(precios[, 3:5]), rowMeans(precios[, 6:7]), rowMeans(precios[, 8:9]), 
+                  rowMeans(precios[, 10:12]), rowMeans(precios[, 3:12]))
+
+colnames(periodos) <- c("P1", "P2", "P3", "P4", "Total")
+```
+
+Ahora calculamos las variaciones relativas de precios entre períodos. Ejemplo: variación de precio entre el período 1 y 2 es igual a (precio2 - precio1) / precio1. También calculamos la variación total, entre períodos 1 y 4
+```{r}
+var1 <- (periodos[, 2] - periodos[, 1]) / periodos[, 1]
+var2 <- (periodos[, 3] - periodos[, 2]) / periodos[, 2]
+var3 <- (periodos[, 4] - periodos[, 3]) / periodos[, 3]
+varT <- (periodos[, 4] - periodos[, 1]) / periodos[, 1]
+
+variaciones <- cbind(var1, var2, var3, varT)
+colnames(variaciones) <- c("CV12", "CV23", "CV34", "CVTotal")
+```
+
+Discretizamos las variaciones en 7 categorías según rangos de valores:
+```{r}
+variaciones.disc <- discretize(variaciones, method = "fixed", right = FALSE,
+                               breaks = c(-Inf, -0.05, -0.02, -0.005, 0.005, 0.05, 0.1, Inf),
+                               labels = c("Disminución Fuerte", "Disminución Media", "Disminución Leve",
+                                          "Mantiene", "Aumento Leve", "Aumento Medio", "Aumento Fuerte"))
+
+variaciones.disc <- matrix(variaciones.disc, ncol = 4)
+colnames(variaciones.disc) <- c("Var12", "Var23", "Var34", "VarTotal")
+```
+
+Para cada período, calculamos el precio promedio de cada producto (promediando en todas las sucursales) y lo agregamos como columnas aparte.
+```{r}
+precios.con.periodos <- cbind(precios, periodos) # Uno los precios con los periodos
+
+# Calculo los precios por cada producto en cada periodo (y en total) y genero un dataframe nuevo con esta informacion
+precios.por.prod = precios.con.periodos %>% 
+  group_by(producto) %>%
+  dplyr::summarise(MediaP1 = mean(P1),
+                   MediaP2 = mean(P2),
+                   MediaP3 = mean(P3),
+                   MediaP4 = mean(P4),
+                   MediaTotal = mean(Total))
+
+# Hago un join de la tabla de precios con periodos y de la tabla de precios promedio por producto utilizando el id del producto, que se encuentra en ambos dataframes.
+precios.full <- left_join(precios.con.periodos, precios.por.prod, by = c("producto" = "producto"))
+dim(precios.full)
+colnames(precios.full)
+```
+
+Ahora calculamos el precio relativo de cada producto en una dada sucursal, por cada periodo y en total. Relativo respecto del precio promedio de ese producto en todas las sucursales. Por ejemplo, el precio relativo del periodo 1 se calcula (P1 - MediaP1) / MediaP1. Luego discretizamos dichos precios en siente categorías distintas, de acuerdo a rangos de valores.
+```{r}
+# Dataframe con precios relativos
+precios.rel <- (precios.full[,13:17] - precios.full[,18:22]) / precios.full[,18:22]
+
+# Precios relativos discretizados
+precios.rel.disc <- discretize(as.matrix(precios.rel), method = "fixed", right = FALSE,
+                               breaks = c(-Inf, -0.1, -0.05, -0.01, 0.01, 0.05, 0.1, Inf),
+                               labels = c("Muy barato", "Medianamente barato", "Levemente barato",
+                                          "Medio", "Levemente caro", "Medio caro", "Muy caro"))
+# Transformamos en matrix
+precios.rel.disc <- matrix(precios.rel.disc, ncol = 5)
+
+# Nombramos las columnas
+colnames(precios.rel.disc) <- c("Precio_P1", "Precio_P2", "Precio_P3", "Precio_P4", "Precio_Total")
+```
+
+Finalmente unimos las columnas de interes, que son: id del producto, id de sucursal, las variaciones relativas discretizadas y los precios relativos discretizados.
+```{r}
+precios <- cbind(precios.full[,1:2], precios.rel.disc, variaciones.disc)
+summary(precios)
+```
+
+
+TRANSFORMACION DEL DATAFRAME 'SUCURSALES' PARA ADAPTARLO AL ANALISIS MEDIANTE REGLAS DE ASOCIACION
+TRATAMIENTO DE TEXTOS DE DESCRIPCIONES DE PRODUCTOS 
+
+```{r}
+#Función que recibe un documento de texto (string) y lo procesa de la siguiente manera: lo pasa a minúscula, elimina todos los caracteres numéricos, elimina los signos de puntutación, elimina todo tipo de acentos, y remueve espacios en blanco al ppio y al final o más de 1 espacio en blanco consecutivo dentro del texto.
+processText <- function(x) {
+  x <- x %>% 
+       tolower() %>%
+       tm::removeNumbers() %>%
+       tm::removePunctuation() %>%
+       stringi::stri_trans_general(id = "Latin-ASCII") %>%
+       trimws() %>%
+       tm::stripWhitespace()
+  return(x)
+}
+
+# Aplicamos la funcion de arriba a todas las celdas de las columnas nombre, marca y presentacion de los productos. Guardamos los resultados en un dataframe aparte para su posterior uso
+prod.text.col <- apply(productos[, c("nombre", "marca", "presentacion")], c(1,2), processText)
+```
+
+```{r}
+# Lista de todas las unidades de medicion de los productos
+unidades <- unique(prod.text.col[, "presentacion"])
+
+# Lista de todas las marcas
+marcas <- unique(prod.text.col[, "marca"])
+
+# De la columna 'nombre' eliminamos todas las unidades de medicion y las marcas. También eliminamos las palabras sin relevancia (como articulos, preposiciones, etc) y las palabras de 1 solo caracter.
+prod.text.col[,"nombre"] <- prod.text.col[,"nombre"] %>% 
+  tm::removeWords(unidades) %>%
+  tm::removeWords(marcas) %>%
+  tm::removeWords(tm::stopwords(kind = "es")) %>%
+  tm::removeWords(letters) %>%
+  trimws() %>%
+  tm::stripWhitespace()
+
+# Guardamos la columna 'nombre' ya procesada en otro dataframe, junto con un docs_id (que se necesita para generar un corpus de textos con el paquete tm a continuacion)
+docs = data.frame(cbind(doc_id = 1:length(prod.text.col[,"nombre"]), text = prod.text.col[,"nombre"]))
+```
+
+
+Con el paquete tm generamos un corpus a partir de los nombres de los productos ya procesados, y luego una matriz documento-termino, donde cada fila representa un documento (nombre de producto) y cada columna una palabra distinta. Una celda (i,j) contendran un 1 si el documento 'i' contiene la palabra 'j' y 0 de lo contrario.
+```{r}
+corpus <- tm::VCorpus(tm::DataframeSource(docs))
+dtm <- tm::DocumentTermMatrix(corpus)
+tm::inspect(dtm)
+```
+Se observa que hay 843 palabras distintas y 1000 documentos (correspondientes a los nombres de los 1000 productos)
+
+
+```{r}
+# Convertimos la matriz documento-termino a dataframe
+terminos.df <- as.matrix(dtm)
+
+# Obtenemos los terminos cuya frecuencia sea mayor o igual a 15
+freq.words = tm::findFreqTerms(dtm, lowfreq = 15, highfreq = Inf)
+length(freq.words)
+```
+
+
+```{r}
+# Nos quedamos solo con los terminos frecuentos
+terminos.df <- terminos.df[, freq.words]
+
+# Agreganos prefioj termino a cada palabra
+colnames(terminos.df) <- paste0('termino_', colnames(terminos.df))
+
+terminos.df <- as.data.frame(terminos.df)
+
+# Unimos el termino "clasico" y "clasicas" en un solo termino: "clasic"
+terminos.df$termino_clasic = ifelse(terminos.df$termino_clasicas | terminos.df$termino_clasico, 1, 0)
+terminos.df$termino_clasicas <- NULL
+terminos.df$termino_clasico <- NULL
+
+# Donde hay 0 reemplazamos por NA, y donde hay 1 por 'S'
+terminos.df[terminos.df == 0] = NA
+terminos.df[terminos.df == 1] = "S"
+
+# Finalmente, unimos el dataframe de terminos con los productos originales
+productos <- cbind(productos, terminos.df)
+```
+
+ULTIMOS JOINS PARA OBTENER EL DATAFRAME FINAL
+
+
+Hacemos 3 left joins de cada dataframe para unirlos en un único dataframe grande que contega los datos de precios relativos en cada periodo, variaciones, productos, terminos, sucursal, barrio, etc.
+```{r}
+precios <- left_join(precios, productos, by = c("producto" = "id"))
+precios <- left_join(precios, sucursales.con.barrio, by = c("sucursal" = "id"))
+#precios <- left_join(precios, dolar, by = c("fecha" = "Fecha")) # VER DESPUES SI HACEMOS ALGUN ANALISIS CON EL DOLAR
+```
+
+Eliminamos columnas irrelevantes del dataset final
+```{r}
+# ELIMINAR TERMINOS IRRELEVANTES PARA EL ANALISIS
+#precios <- subset(precios, select=-c(Divisa.Compra, Divisa.Venta))
+```
+
+
+GENERACION DE REGLAS
+
+```{r}
+cols.to.delete = which(colnames(precios) %in% c("producto", "sucursal", "nombre", "presentacion", "provincia", "banderaId", "localidad", "sucursalNombre", "comercioId", "sucursalId", "lng", "lat", "PERIMETRO", "AREA", "direccion", "marca", "BARRIO", "COMUNA", "AVENIDA", "Var12", "Var23", "Var34", "VarTotal", "Precio_Total"))
+
+t <- as(precios[,-cols.to.delete], "transactions")
+
+reglas <- apriori(t, parameter = list(support=0.001, confidence=0.2, target = "rules", minlen=2, maxlen=7))
+```
+
+```{r}
+hist(reglas@quality$support, breaks=400, col="blue", 
+     border="blue", main="Distribución de los soportes", xlab="Soporte (escala logaritmica)", prob=FALSE)
+```
+
+
+
+```{r}
+#inspect(sort(reglas, by="confidence", decreasing = TRUE))
+```
+
+
+Subconjunto para analisis de reglas interesantes en gral
+```{r}
+rules.sub <- subset(reglas, subset = (lift > 1.3) & (support < 0.1)
+                    & (!(lhs %pin% "banderaDescripcion") | ((lhs %pin% "banderaDescripcion") & !(rhs %pin% "comercioRazonSocial")))
+                    & (!(lhs %pin% "banderaDescripcion") | ((lhs %pin% "banderaDescripcion") & !(lhs %pin% "comercioRazonSocial")))
+                    & (!(lhs %pin% "comercioRazonSocial") | ((lhs %pin% "comercioRazonSocial") & !(lhs %pin% "banderaDescripcion")))
+                    & (!(lhs %pin% "BARRIO") | ((lhs %pin% "BARRIO") & !(rhs %pin% "COMUNA")))
+                    & (!(lhs %pin% "BARRIO") | ((lhs %pin% "BARRIO") & !(lhs %pin% "COMUNA")))
+                    & (!(lhs %pin% "COMUNA") | ((lhs %pin% "COMUNA") & !(rhs %pin% "BARRIO")))
+                    & (!(lhs %pin% "COMUNA") | ((lhs %pin% "COMUNA") & !(lhs %pin% "BARRIO")))
+                    & (!(lhs %pin% "marca") | ((lhs %pin% "marca") & !(rhs %pin% "categoria")))
+                    & (!(lhs %pin% "comercioRazonSocial=Coto Centro Integral") | ((lhs %pin% "comercioRazonSocial=Coto Centro Integral") 
+                                                                                  & !(rhs %pin% "banderaDescripcion=COTO CICSA")))
+                    & (!(lhs %pin% "comercioRazonSocial=DIA Argentina") | ((lhs %pin% "comercioRazonSocial=DIA Argentina") 
+                                                                                  & !(rhs %pin% "banderaDescripcion=Supermercados DIA")))
+                    & (!(lhs %pin% "comercioRazonSocial=Josimar") | ((lhs %pin% "comercioRazonSocial=Josimar") 
+                                                                                  & !(rhs %pin% "banderaDescripcion=JOSIMAR")))
+                    & (!(lhs %pin% "BARRIO") | ((lhs %pin% "BARRIO") & ((lhs %pin% "BELGRANO") | (lhs %pin% "BALVANERA") 
+                                                    | (lhs %pin% "CABALLITO") | (lhs %pin% "RECOLETA") | (lhs %pin% "PALERMO"))))
+                    & (!(rhs %pin% "BARRIO") | ((rhs %pin% "BARRIO") & ((rhs %pin% "BELGRANO") | (rhs %pin% "BALVANERA") 
+                                                    | (rhs %pin% "CABALLITO") | (rhs %pin% "RECOLETA") | (rhs %pin% "PALERMO"))))
+                    & (!(lhs %pin% "banderaDescripcion") | ((lhs %pin% "banderaDescripcion") & !(rhs %pin% "sucursalTipo")))
+                    & (!(lhs %pin% "termino_") | ((lhs %pin% "termino_") & !(rhs %pin% "categoria")))
+                    & (!(lhs %pin% "termino_") | ((lhs %pin% "termino_") & !(rhs %pin% "marca")))
+                    & (!((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P2")) | (((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P2")) 
+                                                                               & !(rhs %pin% "Var12")))
+                    & (!((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P3")) | (((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P3")) 
+                                                                               & !(rhs %pin% "Var23")))
+                    & (!((lhs %pin% "Precio_P3") & (lhs %pin% "Precio_P4")) | (((lhs %pin% "Precio_P3") & (lhs %pin% "Precio_P4")) 
+                                                                               & !(rhs %pin% "Var34")))
+                    & (!((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P2")) | (((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P2")) 
+                                                                               & !(lhs %pin% "Var12")))
+                    & (!((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P3")) | (((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P3")) 
+                                                                               & !(lhs %pin% "Var23")))
+                    & (!((lhs %pin% "Precio_P3") & (lhs %pin% "Precio_P4")) | (((lhs %pin% "Precio_P3") & (lhs %pin% "Precio_P4")) 
+                                                                               & !(lhs %pin% "Var34")))
+                    & (!(lhs %pin% "Precio_P") | ((lhs %pin% "Precio_P") & !(lhs %pin% "Precio_Total")))
+                    & (!(lhs %pin% "Precio_Total") | ((lhs %pin% "Precio_Total") & !(lhs %pin% "Precio_P")))
+                    & (!(lhs %pin% "Precio_Total") | ((lhs %pin% "Precio_Total") & !(rhs %pin% "Precio")))
+                    & (!(lhs %pin% "VarTotal") | ((lhs %pin% "VarTotal") & 
+                                                  !((lhs %pin% "Var12") | (lhs %pin% "Var23") | (lhs %pin% "Var34")) ))
+                    & (!(lhs %pin% "VarTotal") | ((lhs %pin% "VarTotal") & !(rhs %pin% "Var")))
+                    & (!((lhs %pin% "Var12") | (lhs %pin% "Var23") | (lhs %pin% "Var34")) | 
+                         (((lhs %pin% "Var12") | (lhs %pin% "Var23") | (lhs %pin% "Var34")) & !(lhs %pin% "VarTotal")))
+                    & (!((lhs %pin% "Precio_P1") & (lhs %pin% "Var12")) | (((lhs %pin% "Precio_P1") & (lhs %pin% "Var12")) 
+                                                                               & !(rhs %pin% "Precio_P2")))
+                    & (!((lhs %pin% "Precio_P2") & (lhs %pin% "Var12")) | (((lhs %pin% "Precio_P2") & (lhs %pin% "Var12")) 
+                                                                               & !(rhs %pin% "Precio_P1")))
+                    & (!((lhs %pin% "Precio_P2") & (lhs %pin% "Var23")) | (((lhs %pin% "Precio_P2") & (lhs %pin% "Var23")) 
+                                                                               & !(rhs %pin% "Precio_P3")))
+                    & (!((lhs %pin% "Precio_P3") & (lhs %pin% "Var23")) | (((lhs %pin% "Precio_P3") & (lhs %pin% "Var23")) 
+                                                                               & !(rhs %pin% "Precio_P2")))
+                    & (!((lhs %pin% "Precio_P3") & (lhs %pin% "Var34")) | (((lhs %pin% "Precio_P3") & (lhs %pin% "Var34")) 
+                                                                               & !(rhs %pin% "Precio_P4")))
+                    & (!((lhs %pin% "Precio_P4") & (lhs %pin% "Var34")) | (((lhs %pin% "Precio_P4") & (lhs %pin% "Var34")) 
+                                                                               & !(rhs %pin% "Precio_P3")))
+                    & (!(lhs %pin% "Var") | ((lhs %pin% "Var") & !(rhs %pin% "VarTotal")))
+                    & (!(lhs %pin% "Precio") | ((lhs %pin% "Precio") & !(rhs %pin% "Precio_Total")))
+                    & (!(lhs %pin% "marca") | ((lhs %pin% "marca") & !(rhs %pin% "termino_")))
+                    & (!(lhs %pin% "termino_") | ((lhs %pin% "termino_") & !(rhs %pin% "termino_")))
+#                    & ((rhs %pin% "Var") | (rhs %pin% "Precio"))
+                    & (!(lhs %pin% "Var23") | ((lhs %pin% "Var23") & !(rhs %pin% "Var12")))
+                    & (!(lhs %pin% "Var34") | ((lhs %pin% "Var34") & !(rhs %pin% "Var12")))
+                    & (!(lhs %pin% "Var34") | ((lhs %pin% "Var34") & !(rhs %pin% "Var23")))
+                    & (!((((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P2")) | ((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P3")) |
+                      ((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P4")) | ((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P3")) |
+          ((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P4")) | ((lhs %pin% "Precio_P3") & (lhs %pin% "Precio_P4"))))
+                      | (((((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P2")) | ((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P3")) |
+                      ((lhs %pin% "Precio_P1") & (lhs %pin% "Precio_P4")) | ((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P3")) |
+          ((lhs %pin% "Precio_P2") & (lhs %pin% "Precio_P4")) | ((lhs %pin% "Precio_P3") & (lhs %pin% "Precio_P4")))) & 
+                      !(rhs %pin% "Precio" | rhs %pin% "Var")))
+                    & (!(lhs %pin% "Var" & lhs %pin% "Precio"))
+                    & (!(lhs %pin% "VarTotal"))
+                    & (!(rhs %pin% "VarTotal"))
+                    & (!(lhs %pin% "COMUNA" | lhs %pin% "BARRIO") | ((lhs %pin% "COMUNA" | lhs %pin% "BARRIO") & !(rhs %pin% "AVENIDA")) )
+                    & (!(rhs %pin% "Precio_P2") | ((rhs %pin% "Precio_P2") & ((lhs %pin% "Precio_P1") | !(lhs %pin% "Precio")) ))
+                    & (!(rhs %pin% "Precio_P3") | ((rhs %pin% "Precio_P3") & ((lhs %pin% "Precio_P2") | !(lhs %pin% "Precio")) ))
+                    & (!(rhs %pin% "Precio_P4") | ((rhs %pin% "Precio_P4") & ((lhs %pin% "Precio_P3") | !(lhs %pin% "Precio")) ))
+                    & (!(rhs %pin% "marca"))
+#                     & (lhs %pin% "categoria" & rhs %pin% "Var")
+#                     & !(rhs %pin% "VarTotal")
+#                     & !(lhs %pin% "MASCOTAS")
+#                     & !(rhs %pin% "Disminución")
+                    )
+arulesViz::ruleExplorer(rules.sub)
+
+
+#write(rules.sub,
+#      file = "reglas.csv",
+#      sep = ",",
+#      quote = TRUE,
+#      row.names = TRUE)
+```
+DOVE, REXONA< AXE
+```{r}
+rules.sub2 <- subset(rules.sub, subset = (rhs %pin% "Levemente caro") & (lhs %pin% "agua") & (lhs %pin% "Jumbo") & (lhs %pin% "SIN ALCOHOL") & !(lhs %pin% "marca") & !(lhs %pin% "saborizada")  & !(rhs %pin% "Total") & !(lhs %pin% "gas") & !(lhs %pin% "Var") & !(lhs %pin% "sucursal") & !(lhs %pin% "Precio") & !(lhs %pin% "AVENIDA"))
+arulesViz::ruleExplorer(rules.sub2) 
+```
+```{r}
+rules.sub4 <- subset(rules.sub, subset = lhs %pin% "BARRIO" & rhs %pin% "Precio"& !(lhs %pin% "Precio") & !(lhs %pin% "Var") & !(lhs %pin% "AVENIDA")  & (rhs %pin% "Total"))
+arulesViz::ruleExplorer(rules.sub4)
+```
+
+
+```{r}
+rules.sub3 <- subset(rules.sub, subset = (lhs %pin% "Var23=Aumento Medio") & (rhs %pin% "Var34=Mantiene"))
+arulesViz::ruleExplorer(rules.sub3) 
+
+```
+
+
+
+PRECIOS
+```{r}
+rules.sub3 <- subset(reglas, subset = ((lhs %pin% "BEBIDAS SIN ALCOHOL" & lhs %pin% "agua" & lhs %pin% "Jumbo Retail" & rhs %pin% "Levemente caro" & count > 900 & confidence > 0.50 & !(lhs %pin% "Precio") & !(lhs %pin% "gas") & !(lhs %pin% "sucursalTipo"))
+                     | (lhs %pin% "BEBIDAS CON ALCOHOL" & lhs %pin% "vino" & lhs %pin% "INC S.A." & rhs %pin% "Muy barato" & count > 2000 & confidence > 0.69 & !(lhs %pin% "Precio") & !(lhs %pin% "gas") & !(lhs %pin% "sucursalTipo"))
+                     | (lhs %pin% "BEBIDAS CON ALCOHOL" & lhs %pin% "tinto" & lhs %pin% "vino" & lhs %pin% "INC S.A." & rhs %pin% "Muy barato" & count > 1500 & confidence > 0.7 & !(lhs %pin% "Precio") & !(lhs %pin% "gas") & !(lhs %pin% "sucursalTipo"))
+                     | (lhs %pin% "BEBIDAS SIN ALCOHOL" & lhs %pin% "agua" & lhs %pin% "COTO" & rhs %pin% "Medio" & count > 1190 & confidence > 0.48 & !(lhs %pin% "Precio") & !(lhs %pin% "gas") & !(lhs %pin% "comercio"))
+                     | (!(lhs %pin% "categoria") & lhs %pin% "queso" & lhs %pin% "COTO" & rhs %pin% "Medio" & count > 600 & confidence > 0.3 & !(lhs %pin% "Precio") & !(lhs %pin% "gas") & !(lhs %pin% "comercio") & !(lhs %pin% "untable") & !(lhs %pin% "sucursalTipo")) ))
+arulesViz::ruleExplorer(rules.sub3) 
+```
+
+
+```{r}
+plot(rules.sub, method="grouped matrix", measure = "confidence", shading = "support", rhs_max = 50, control=list(reverse=TRUE, lhs_items=1), main="Matriz agrupada de Categorias => Variaciones de Precios")
+
+```
+
+
+
+```{r}
+#arulesViz::plotly_arules(rules.sub)
+
+library(arulesViz)
+
+#?arulesViz::saveAsGraph
+#plot(rules.sub, method="paracoord", measure="support", control = list(reorder=TRUE))
+```
+
+
+```{r}
+reglas.aumfuerte <- subset(reglas, subset = !(lhs %pin% "VarTotal") & lhs %pin% "Var23" & rhs %pin% "Var34")
+
+write(reglas.aumfuerte,
+      file = "variaciones.csv",
+      sep = ",",
+      quote = TRUE,
+      row.names = TRUE)
+
+```
+
+
+
+```{r}
+reglas.simples <- subset(reglas, subset = (lhs %pin% "Var23") & (rhs %pin% "Var34"))
+
+plot(rules.sub, method="grouped matrix", control=list(reverse=FALSE))
+
+
+#write(reglas.simples,
+#      file = "reglasSimples2.csv",
+#      sep = ",",
+#      quote = TRUE,
+#      row.names = TRUE)
+
+```
+
+
+
+```{r}
+r = rules.sub@quality %>% 
+  group_by(support, confidence, lift, count) %>%
+  dplyr::summarise()
+
+rules.sub@quality$
+```
+
+
+
+Subconjunto para analisis de aceleracion/desaceleracion de precios
+```{r}
+rules.sub1 <- subset(reglas, subset = ((lhs %pin% "Var12") | (lhs %pin% "Var23")) & (rhs %pin% "Var34=Disminución Media"))
+
+write(rules.sub1,
+      file = "reglasVar34DismLeve.csv",
+      sep = ",",
+      quote = TRUE,
+      row.names = TRUE)
+```
+
+
+Subconjunto para la consigna de los precios en P1, P2, P3 y P4
+```{r}
+rules.sub3 <- subset(reglas, subset = !(lhs %pin% "Precio") & rhs %pin% "Precio_P" & lift > 1.5)
+
+write(rules.sub3,
+      file = "reglasPeriodos.csv",
+      sep = ",",
+      quote = TRUE,
+      row.names = TRUE)
+```
+
+
+```{r}
+summary(precios)
+```
+```{r}
+write.csv(precios,
+      file = "precios.csv")
+```
+
+
+```{r}
+precios[precios$catego == "Mantiene" & precios$banderaDescripcion == "COTO CICSA" & precios$Precio_P3 == "Medio" & precios$termino_yogur == "S",]
+```
+```{r}
+precios[precios$Var23 == "Mantiene" & precios$Var34 == "Mantiene",]
+```
+
+
+```{r}
+library(networkD3)
+library(tidyr)
+
+nodes <- data.frame(node = c(0:13), 
+                    name = c("Var23=Aumento Fuerte", "Var23=Aumento Medio", "Var23=Aumento Leve", "Var23=Mantiene", 
+                             "Var23=Disminución Leve", "Var23=Disminución Media", "Var23=Disminución Fuerte", 
+                             "Var34=Aumento Fuerte", "Var34=Aumento Medio", "Var34=Aumento Leve", "Var34=Mantiene", 
+                             "Var34=Disminución Leve", "Var34=Disminución Media", "Var34=Disminución Fuerte"),
+                    group = c("AF", "AM", "AL", "M", "DL", "DM", "DF", "AF", "AM", "AL", "M", "DL", "DM", "DF")
+                    )
+
+links <- read.csv("variaciones.csv")
+
+networkD3::sankeyNetwork(Links = links, Nodes = nodes, 
+                         Source = 'source', 
+                         Target = 'target', 
+                         Value = 'value', 
+                         NodeID = 'name',
+                         units = 'support', fontSize=16,
+                         NodeGroup = 'group',
+                         LinkGroup = 'group',
+                         width=750,
+                         height=600)
+
+
+
+```
+
